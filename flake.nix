@@ -19,10 +19,18 @@
           cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
           nonRustDeps = [
             # pkgs.libiconv
+            pkgs.libpulseaudio
           ];
           rust-toolchain = pkgs.symlinkJoin {
             name = "rust-toolchain";
-            paths = [ pkgs.rustc pkgs.cargo pkgs.cargo-watch pkgs.rust-analyzer pkgs.rustPlatform.rustcSrc ];
+            paths = [
+              pkgs.cargo
+              pkgs.cargo-outdated
+              pkgs.cargo-watch
+              pkgs.rust-analyzer
+              pkgs.rustPlatform.rustcSrc
+              pkgs.rustc
+            ];
           };
         in
         {
@@ -31,6 +39,11 @@
             inherit (cargoToml.package) name version;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
+
+            buildInputs = nonRustDeps;
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+            ];
           };
 
           # Rust dev environment
