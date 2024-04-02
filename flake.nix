@@ -18,7 +18,7 @@
         let
           cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
           nonRustDeps = [
-            pkgs.libiconv
+            # pkgs.libiconv
           ];
           rust-toolchain = pkgs.symlinkJoin {
             name = "rust-toolchain";
