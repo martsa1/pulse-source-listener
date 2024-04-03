@@ -1,6 +1,8 @@
 use std::{cell::RefCell, error::Error, process::exit, rc::Rc};
 
 use clap::Parser;
+use env_logger::Env;
+use log::{debug, error, info, trace};
 use pulse::{
     callbacks::ListResult,
     context::{Context, FlagSet, State},
@@ -22,16 +24,24 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    let log_env = if args.verbose {
+        Env::default().default_filter_or("debug")
+    } else {
+        Env::default().default_filter_or("info")
+    };
+    env_logger::Builder::from_env(log_env).init();
+
     let mut mainloop = Mainloop::new().ok_or("mailoop new failed")?;
 
     let proplist = Proplist::new().ok_or("proplist failed")?;
     let mut context = Context::new_with_proplist(&mainloop, "source-listener", &proplist)
         .ok_or("context::new_with_proplist failed")?;
 
-    println!("Connecting to daemon");
+    info!("Connecting to daemon");
     connect_to_server(&mut context, &mut mainloop)?;
 
-    println!("We should be connected at this point..!");
+    debug!("We should be connected at this point..!");
 
     let done_flag = Rc::new(RefCell::new(0 as u8));
     let introspector = context.introspect();
@@ -39,21 +49,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cb_done = done_flag.clone();
     introspector.get_source_info_list(move |source_lst_res| match source_lst_res {
         ListResult::Item(src) => {
-            println!("Found source: {:?}", src);
+            trace!("Found source: {:?}", src);
         }
         ListResult::Error => {
-            println!("Something went wrong analysing source info");
+            error!("Something went wrong analysing source info");
         }
         ListResult::End => {
-            println!("End of list, signalling quit to mainloop");
+            info!("End of list, signalling quit to mainloop");
             *cb_done.borrow_mut() += 1;
         }
     });
 
     let cb_done = done_flag.clone();
     introspector.get_server_info(move |server_info| {
-        println!("Server info: {:?}", server_info);
-        println!("Default source: {:?}", server_info.default_source_name);
+        trace!("Server info: {:?}", server_info);
+        info!("Default source: {:?}", server_info.default_source_name);
         *cb_done.borrow_mut() += 1;
     });
 
@@ -62,22 +72,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // executes our various callbacks etc. (true here blocks mainloop to wait for events)
         match mainloop.iterate(true) {
             IterateResult::Err(err) => {
-                println!("Caught error running mainloop: {}", err);
+                error!("Caught error running mainloop: {}", err);
                 exit(1);
             }
             IterateResult::Quit(retval) => {
-                println!("Quit called, retval: {:?}", retval);
+                info!("Quit called, retval: {:?}", retval);
                 exit(retval.0);
             }
             IterateResult::Success(num_dispatched) => {
                 if num_dispatched > 0 {
-                    println!("Iterate succeeded, dispatched {} events", num_dispatched);
+                    trace!("Iterate succeeded, dispatched {} events", num_dispatched);
                 }
 
                 let cbs_done = *done_flag.borrow();
-                println!("{} of 2 introspection callbacks completed", &cbs_done);
+                trace!("{} of 2 introspection callbacks completed", &cbs_done);
                 if cbs_done >= 2 {
-                    println!("Done flagset, quitting");
+                    debug!("Done flagset, quitting");
                     break;
                 }
             }
@@ -94,16 +104,16 @@ fn connect_to_server(context: &mut Context, mainloop: &mut Mainloop) -> Result<(
         // executes our various callbacks etc. (true here blocks mainloop to wait for events)
         match mainloop.iterate(true) {
             IterateResult::Err(err) => {
-                println!("Caught error running mainloop: {}", err);
+                error!("Caught error running mainloop: {}", err);
                 exit(1);
             }
             IterateResult::Quit(retval) => {
-                println!("Quit called, retval: {:?}", retval);
+                info!("Quit called, retval: {:?}", retval);
                 exit(retval.0);
             }
             IterateResult::Success(num_dispatched) => {
                 if num_dispatched > 0 {
-                    println!("Iterate succeeded, dispatched {} events", num_dispatched);
+                    debug!("Iterate succeeded, dispatched {} events", num_dispatched);
                 }
 
                 match context.get_state() {
@@ -111,20 +121,20 @@ fn connect_to_server(context: &mut Context, mainloop: &mut Mainloop) -> Result<(
                     | State::Connecting
                     | State::Authorizing
                     | State::SettingName => {
-                        println!("Context connecting to server");
+                        debug!("Context connecting to server");
                     }
 
                     State::Ready => {
-                        println!("Context connected and ready");
+                        debug!("Context connected and ready");
                         return Ok(());
                     }
 
                     State::Failed => {
-                        println!("Context failed to connect, exiting.");
+                        error!("Context failed to connect, exiting.");
                         return Err("Failed to connect to server".into());
                     }
                     State::Terminated => {
-                        println!("Context was terminated cleanly, quitting");
+                        info!("Context was terminated cleanly, quitting");
                         return Err("Terminated".into());
                     }
                 }
