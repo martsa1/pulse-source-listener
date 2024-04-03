@@ -61,6 +61,9 @@
             '';
             buildInputs = nonRustDeps;
             nativeBuildInputs = with pkgs; [
+              autoPatchelfHook
+              pkg-config
+
               just
               rust-toolchain
             ];
