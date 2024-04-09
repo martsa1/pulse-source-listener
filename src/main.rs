@@ -24,13 +24,7 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-    let log_env = if args.verbose {
-        Env::default().default_filter_or("debug")
-    } else {
-        Env::default().default_filter_or("info")
-    };
-    env_logger::Builder::from_env(log_env).init();
+    setup_logs();
 
     let mut mainloop = Mainloop::new().ok_or("mailoop new failed")?;
 
@@ -55,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             error!("Something went wrong analysing source info");
         }
         ListResult::End => {
-            info!("End of list, signalling quit to mainloop");
+            debug!("End of list, signalling quit to mainloop");
             *cb_done.borrow_mut() += 1;
         }
     });
@@ -67,6 +61,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *cb_done.borrow_mut() += 1;
     });
 
+    iter_loop_to_done(&mut mainloop, &mut context, |_| {
+        // Use Mainloop iterate to process data from pulseaudio server, this iterate is what
+        // executes our various callbacks etc. (true here blocks mainloop to wait for events)
+        let cbs_done = *done_flag.borrow();
+        trace!("{} of 2 introspection callbacks completed", &cbs_done);
+        if cbs_done >= 2 {
+            debug!("Done flagset, quitting");
+            return true;
+        }
+        false
+    })?;
+
+    Ok(())
+}
+
+fn setup_logs() {
+    let args = Args::parse();
+    let log_env = if args.verbose {
+        Env::default().default_filter_or("debug")
+    } else {
+        Env::default().default_filter_or("info")
+    };
+    env_logger::Builder::from_env(log_env).init();
+}
+
+fn iter_loop_to_done(
+    mainloop: &mut Mainloop,
+    context: &mut Context,
+    done_chk: impl Fn(&Context) -> bool,
+) -> Result<(), Box<dyn Error>> {
     loop {
         // Use Mainloop iterate to process data from pulseaudio server, this iterate is what
         // executes our various callbacks etc. (true here blocks mainloop to wait for events)
@@ -84,61 +108,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     trace!("Iterate succeeded, dispatched {} events", num_dispatched);
                 }
 
-                let cbs_done = *done_flag.borrow();
-                trace!("{} of 2 introspection callbacks completed", &cbs_done);
-                if cbs_done >= 2 {
-                    debug!("Done flagset, quitting");
-                    break;
+                if done_chk(context) {
+                    return Ok(());
                 }
             }
         };
     }
-
-    Ok(())
 }
 
 fn connect_to_server(context: &mut Context, mainloop: &mut Mainloop) -> Result<(), Box<dyn Error>> {
     context.connect(None, FlagSet::NOAUTOSPAWN, None)?;
-    loop {
-        // Use Mainloop iterate to process data from pulseaudio server, this iterate is what
-        // executes our various callbacks etc. (true here blocks mainloop to wait for events)
-        match mainloop.iterate(true) {
-            IterateResult::Err(err) => {
-                error!("Caught error running mainloop: {}", err);
-                exit(1);
-            }
-            IterateResult::Quit(retval) => {
-                info!("Quit called, retval: {:?}", retval);
-                exit(retval.0);
-            }
-            IterateResult::Success(num_dispatched) => {
-                if num_dispatched > 0 {
-                    debug!("Iterate succeeded, dispatched {} events", num_dispatched);
-                }
+    iter_loop_to_done(mainloop, context, |context| match context.get_state() {
+        State::Unconnected | State::Connecting | State::Authorizing | State::SettingName => {
+            debug!("Context connecting to server");
+            return false;
+        }
 
-                match context.get_state() {
-                    State::Unconnected
-                    | State::Connecting
-                    | State::Authorizing
-                    | State::SettingName => {
-                        debug!("Context connecting to server");
-                    }
+        State::Ready => {
+            debug!("Context connected and ready");
+            return true;
+        }
 
-                    State::Ready => {
-                        debug!("Context connected and ready");
-                        return Ok(());
-                    }
-
-                    State::Failed => {
-                        error!("Context failed to connect, exiting.");
-                        return Err("Failed to connect to server".into());
-                    }
-                    State::Terminated => {
-                        info!("Context was terminated cleanly, quitting");
-                        return Err("Terminated".into());
-                    }
-                }
-            }
-        };
-    }
+        State::Failed => {
+            error!("Context failed to connect, exiting.");
+            return false;
+        }
+        State::Terminated => {
+            info!("Context was terminated cleanly, quitting");
+            return false;
+        }
+    })?;
+    Ok(())
 }
