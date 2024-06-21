@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::{
     cell::{RefCell, RefMut},
     error::Error,
@@ -268,11 +268,12 @@ fn subscribe_source_mute(
 
     trace!("Configuring context subscriber");
     mainloop.borrow_mut().lock();
+
+    let (tx, rx) = mpsc::channel();
     // tell pulseaudio to notify us about Source & Server changes
     {
         // set callback that reacts to subscription changes
         let mainloop = mainloop.clone();
-        let context_inner = context.clone();
         let state = state.clone();
         context.borrow_mut().set_subscribe_callback(Some(Box::new(
             move |facility: Option<Facility>, operation: Option<Operation>, idx| {
@@ -290,6 +291,7 @@ fn subscribe_source_mute(
                             handle_source_change(Rc::clone(&state).borrow_mut(), operation, idx)
                         {
                             trace!("mainloop should update sources");
+                            let _ = tx.send(Facility::Source);
                             unsafe { (*mainloop.as_ptr()).signal(false) };
                         } else {
                             trace!("source event unrelated to default source, no need to update.");
@@ -297,6 +299,7 @@ fn subscribe_source_mute(
                     }
                     Facility::Server => {
                         info!("Server change event");
+                        let _ = tx.send(Facility::Server);
                         unsafe { (*mainloop.as_ptr()).signal(false) };
                     }
                     _ => debug!("Unrelated event: {:?}", facility),
@@ -327,8 +330,17 @@ fn subscribe_source_mute(
         trace!("old default mute: {}, updating sources", old_default_mute);
         trace!("releasing mainloop lock.");
         mainloop.borrow_mut().unlock();
-        let _ = handle_server_change(&state, &mainloop, &context);
-        state.borrow_mut().sources = get_sources(&context, &mainloop).unwrap();
+        let event_type = rx.recv()?;
+        match event_type {
+            Facility::Server => {
+                let _ = handle_server_change(&state, &mainloop, &context);
+                state.borrow_mut().sources = get_sources(&context, &mainloop).unwrap();
+            },
+            Facility::Source => {
+                state.borrow_mut().sources = get_sources(&context, &mainloop).unwrap();
+            },
+            _ => { panic!("impossible state"); },
+        }
 
         trace!("re-aquiring mainloop lock.");
         mainloop.borrow_mut().lock();
