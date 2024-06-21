@@ -255,7 +255,20 @@ fn setup_logs() {
     } else {
         Env::default().default_filter_or("info")
     };
-    env_logger::Builder::from_env(log_env).init();
+    env_logger::Builder::from_env(log_env)
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} [{}:{}:{}] ({}): {}",
+                Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%z"),
+                record.file().unwrap_or("unknown"),
+                record.line().unwrap_or(0),
+                record.target(),
+                record.level(),
+                record.args(),
+            )
+        })
+        .init();
 }
 
 fn subscribe_source_mute(
