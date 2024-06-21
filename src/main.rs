@@ -1,4 +1,3 @@
-use std::cell::Ref;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -20,8 +19,7 @@ use pulse::{
         subscribe::{Facility, InterestMaskSet, Operation},
         Context, FlagSet, State,
     },
-    // mainloop::standard::{IterateResult, Mainloop},
-    mainloop::{standard::IterateResult, threaded::Mainloop},
+    mainloop::threaded::Mainloop,
     proplist::Proplist,
 };
 
@@ -59,12 +57,6 @@ impl SourceDatum {
 }
 
 #[derive(Debug)]
-enum Event {
-    ServerChange,
-    SourceChange(u32),
-}
-
-#[derive(Debug)]
 struct ListenerState {
     // Use Pulseaudio's source index as key to source data (which is just name and mute-status)
     sources: Sources,
@@ -72,8 +64,8 @@ struct ListenerState {
 }
 
 impl ListenerState {
-    fn new(mainloop: RMainloop, context: RContext) -> Result<Self, Box<dyn Error>> {
-        let sources = get_sources(context.clone(), mainloop.clone())?;
+    fn new(mainloop: &RMainloop, context: &RContext) -> Result<Self, Box<dyn Error>> {
+        let sources = get_sources(context, mainloop)?;
         let default_source = get_default_source(mainloop, context, &sources)?;
         Ok(Self {
             sources,
@@ -98,14 +90,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     info!("Connecting to daemon");
-    connect_to_server(context.clone(), mainloop.clone())?;
+    connect_to_server(&context, &mainloop)?;
 
     debug!("We should be connected at this point..!");
 
-    let state = Rc::new(RefCell::new(ListenerState::new(
-        mainloop.clone(),
-        context.clone(),
-    )?));
+    let state = Rc::new(RefCell::new(ListenerState::new(&mainloop, &context)?));
     subscribe_source_mute(mainloop, context, state)
 }
 
@@ -115,7 +104,7 @@ enum SrcListState {
     Err(String),
 }
 
-fn get_sources(context: RContext, mainloop: RMainloop) -> Result<Sources, Box<dyn Error>> {
+fn get_sources(context: &RContext, mainloop: &RMainloop) -> Result<Sources, Box<dyn Error>> {
     trace!("get sources aquiring mainloop lock");
     mainloop.borrow_mut().lock();
     trace!("mainloop locked");
@@ -173,7 +162,6 @@ fn get_sources(context: RContext, mainloop: RMainloop) -> Result<Sources, Box<dy
             }
         }
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -184,8 +172,8 @@ enum DefaultSourceState {
 }
 
 fn find_default_source_name(
-    context: RContext,
-    mainloop: RMainloop,
+    context: &RContext,
+    mainloop: &RMainloop,
 ) -> Result<String, Box<dyn Error>> {
     mainloop.borrow_mut().lock();
     let introspector = context.borrow_mut().introspect();
@@ -231,8 +219,8 @@ fn find_default_source_name(
 }
 
 fn get_default_source(
-    mainloop: RMainloop,
-    context: RContext,
+    mainloop: &RMainloop,
+    context: &RContext,
     sources: &Sources,
 ) -> Result<u32, Box<dyn Error>> {
     let default_source_name = find_default_source_name(context, mainloop)?;
@@ -259,11 +247,10 @@ fn setup_logs() {
         .format(|buf, record| {
             writeln!(
                 buf,
-                "{} [{}:{}:{}] ({}): {}",
+                "{} [{}:{}] ({}): {}",
                 Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%z"),
                 record.file().unwrap_or("unknown"),
                 record.line().unwrap_or(0),
-                record.target(),
                 record.level(),
                 record.args(),
             )
@@ -299,11 +286,9 @@ fn subscribe_source_mute(
                 match facility {
                     Facility::Source => {
                         debug!("Source event");
-                        if let Ok(Some(())) = handle_source_change(
-                            Rc::clone(&state).borrow_mut(),
-                            operation,
-                            idx,
-                        ) {
+                        if let Ok(Some(())) =
+                            handle_source_change(Rc::clone(&state).borrow_mut(), operation, idx)
+                        {
                             trace!("mainloop should update sources");
                             unsafe { (*mainloop.as_ptr()).signal(false) };
                         } else {
@@ -334,14 +319,13 @@ fn subscribe_source_mute(
         );
     });
 
-    // TODO: We need to loop on mainloop wait here...
+    // TODO: We should also bind to shutdown signal for clean teardown here...
     loop {
         mainloop.borrow_mut().wait();
         trace!("Caught signal in subscribe loop");
 
         // When we are signalled here, it means, we should update sources, and then print if the
         // mute state of the default source, changed.
-        //
 
         let old_default_mute = state.borrow().default_source().unwrap().mute;
         trace!("old default mute: {}, updating sources", old_default_mute);
@@ -363,15 +347,12 @@ fn subscribe_source_mute(
             );
         }
     }
-    // TODO: We should also bind to shutdown signal for clean teardown here...
-    mainloop.borrow_mut().unlock();
-    Ok(())
 }
 
 fn handle_server_change(
-    state: RState,
-    mainloop: RMainloop,
-    context: RContext,
+    state: &RState,
+    mainloop: &RMainloop,
+    context: &RContext,
 ) -> Result<(), Box<dyn Error>> {
     // Check if default source changed and update state
     debug!("Updating default source after server config change");
@@ -386,11 +367,7 @@ fn handle_server_change(
 
     debug!(
         "Default source is now: {}",
-        state
-            .borrow()
-            .default_source()
-            .unwrap()
-            .name
+        state.borrow().default_source().unwrap().name
     );
 
     Ok(())
@@ -431,7 +408,7 @@ fn handle_source_change(
     Ok(None)
 }
 
-fn connect_to_server(context: RContext, mainloop: RMainloop) -> Result<(), Box<dyn Error>> {
+fn connect_to_server(context: &RContext, mainloop: &RMainloop) -> Result<(), Box<dyn Error>> {
     trace!("Calling context.connect");
 
     {
