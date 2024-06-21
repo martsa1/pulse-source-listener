@@ -297,11 +297,7 @@ fn subscribe_source_mute(
                     }
                     Facility::Server => {
                         info!("Server change event");
-                        let _ = handle_server_change(
-                            state.clone(),
-                            mainloop.clone(),
-                            context_inner.clone(),
-                        );
+                        unsafe { (*mainloop.as_ptr()).signal(false) };
                     }
                     _ => debug!("Unrelated event: {:?}", facility),
                 }
@@ -331,8 +327,8 @@ fn subscribe_source_mute(
         trace!("old default mute: {}, updating sources", old_default_mute);
         trace!("releasing mainloop lock.");
         mainloop.borrow_mut().unlock();
-        state.borrow_mut().sources =
-            get_sources(Rc::clone(&context), Rc::clone(&mainloop)).unwrap();
+        let _ = handle_server_change(&state, &mainloop, &context);
+        state.borrow_mut().sources = get_sources(&context, &mainloop).unwrap();
 
         trace!("re-aquiring mainloop lock.");
         mainloop.borrow_mut().lock();
@@ -359,11 +355,8 @@ fn handle_server_change(
     // TODO: Do we need to check if the source map needs updating...?
     // Ideally - we collect sources once on start, then use the source add/remove subscriptions to
     // keep updated...
-    state.borrow_mut().default_source = get_default_source(
-        mainloop.clone(),
-        context.clone(),
-        &state.borrow_mut().sources,
-    )?;
+    let default_source_idx = get_default_source(mainloop, context, &state.borrow().sources)?;
+    state.borrow_mut().default_source = default_source_idx;
 
     debug!(
         "Default source is now: {}",
