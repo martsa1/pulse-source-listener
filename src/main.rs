@@ -1,8 +1,10 @@
+mod callbacks;
+
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::mpsc;
 use std::{
-    cell::{RefCell, RefMut},
+    cell::RefCell,
     error::Error,
     ops::Deref,
 };
@@ -25,7 +27,6 @@ use pulse::{
 
 type RContext = Rc<RefCell<Context>>;
 type RMainloop = Rc<RefCell<Mainloop>>;
-type RState = Rc<RefCell<ListenerState>>;
 
 type Sources = HashMap<u32, SourceDatum>;
 
@@ -56,7 +57,7 @@ impl SourceDatum {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ListenerState {
     // Use Pulseaudio's source index as key to source data (which is just name and mute-status)
     sources: Sources,
@@ -66,7 +67,7 @@ struct ListenerState {
 impl ListenerState {
     fn new(mainloop: &RMainloop, context: &RContext) -> Result<Self, Box<dyn Error>> {
         let sources = get_sources(context, mainloop)?;
-        let default_source = get_default_source(mainloop, context, &sources)?;
+        let default_source = get_default_source_index(mainloop, context, &sources)?;
         Ok(Self {
             sources,
             default_source,
@@ -94,70 +95,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     debug!("We should be connected at this point..!");
 
-    let state = Rc::new(RefCell::new(ListenerState::new(&mainloop, &context)?));
+    let state = ListenerState::new(&mainloop, &context)?;
     subscribe_source_mute(mainloop, context, state)
 }
 
 enum SrcListState {
-    InProg,
+    // InProg,
+    Item(u32, SourceDatum),
     Done,
     Err(String),
 }
 
 fn get_sources(context: &RContext, mainloop: &RMainloop) -> Result<Sources, Box<dyn Error>> {
-    trace!("get sources aquiring mainloop lock");
+    // Lock mainloop to block pulseaudio from calling things during setup
     mainloop.borrow_mut().lock();
-    trace!("mainloop locked");
 
     let introspector = context.borrow_mut().introspect();
 
-    let done = Rc::new(RefCell::new(SrcListState::InProg));
-    let sources = Rc::new(RefCell::new(HashMap::new()));
+    let (src_tx, src_rx) = mpsc::channel();
+    introspector.get_source_info_list(move |src| match src {
+        ListResult::Error => {
+            let msg = "Failed to retrieve ListResult".into();
+            error!("{}", msg);
+            src_tx.send(SrcListState::Err(msg)).unwrap();
+        }
+        ListResult::End => {
+            src_tx.send(SrcListState::Done).unwrap();
+        }
+        ListResult::Item(item) => {
+            let source_name = match &item.name {
+                None => "unknown".to_string(),
+                Some(name) => name.to_string(),
+            };
 
-    {
-        let sources = sources.clone();
-        let done = Rc::clone(&done);
+            src_tx.send(
+                SrcListState::Item(
+                    item.index,
+                    SourceDatum::new(source_name, item.mute)
+                )
+            ).unwrap();
+        }
+    });
 
-        let mainloop = Rc::clone(&mainloop);
+    let mut sources = HashMap::new();
 
-        introspector.get_source_info_list(move |src| match src {
-            ListResult::Error => {
-                let msg = "Failed to retrieve ListResult".into();
-                error!("{}", msg);
-                *done.borrow_mut() = SrcListState::Err(msg);
-                unsafe { (*mainloop.as_ptr()).signal(false) };
-            }
-            ListResult::End => {
-                *done.borrow_mut() = SrcListState::Done;
-                unsafe { (*mainloop.as_ptr()).signal(false) };
-            }
-            ListResult::Item(item) => {
-                let source_name = match &item.name {
-                    None => "unknown".to_string(),
-                    Some(name) => name.to_string(),
-                };
-
-                sources
-                    .borrow_mut()
-                    .insert(item.index, SourceDatum::new(source_name, item.mute));
-            }
-        });
-    }
-
+    // Unlock mainloop to let pulseaudio call the above callback.
+    mainloop.borrow_mut().unlock();
     loop {
-        debug!("Waiting on mainloop signal");
-        mainloop.borrow_mut().wait();
-        match done.borrow_mut().deref() {
-            SrcListState::InProg => continue,
+        let item = src_rx.recv()?;
+
+        match item {
+            SrcListState::Item(index, source) => {
+                sources.insert(index, source);
+            }
             SrcListState::Done => {
-                trace!("get sources unlocking mainloop lock");
-                mainloop.borrow_mut().unlock();
-                return Ok(sources.borrow().deref().clone());
+                trace!("Retrieved source info");
+                return Ok(sources);
             }
             SrcListState::Err(err) => {
                 error!("Caught error waiting: {}", err);
-                trace!("get sources unlocking mainloop lock");
-                mainloop.borrow_mut().unlock();
                 return Err(err.to_owned().into());
             }
         }
@@ -168,57 +164,55 @@ fn get_sources(context: &RContext, mainloop: &RMainloop) -> Result<Sources, Box<
 enum DefaultSourceState {
     NoDefault,
     Default(String),
-    Unset,
 }
 
 fn find_default_source_name(
     context: &RContext,
     mainloop: &RMainloop,
 ) -> Result<String, Box<dyn Error>> {
+    // Block pulseaudio from inboking callbacks
     mainloop.borrow_mut().lock();
+
     let introspector = context.borrow_mut().introspect();
+    let (src_tx, src_rx) = mpsc::channel();
 
-    let default_source = Arc::new(Mutex::new(DefaultSourceState::Unset));
+    {
+        introspector.get_server_info(move |server_info| {
+            trace!("Server info: {:?}", server_info);
+            match &server_info.default_source_name {
+                None => {
+                    info!("no default source");
+                    src_tx.send(DefaultSourceState::NoDefault).unwrap()
+                }
+                Some(value) => {
+                    info!("Default source: '{:?}'", value);
+                    src_tx
+                        .send(DefaultSourceState::Default(value.to_string()))
+                        .unwrap();
+                }
+            };
+        });
+    }
 
-    let default_source_inner = default_source.clone();
-    let mainloop_inner = Rc::clone(&mainloop);
-    introspector.get_server_info(move |server_info| {
-        trace!("Server info: {:?}", server_info);
-        let mut default_source = default_source_inner.lock().unwrap();
-        match &server_info.default_source_name {
-            None => *default_source = DefaultSourceState::NoDefault,
-            Some(value) => {
-                *default_source = DefaultSourceState::Default(value.to_string());
-            }
-        };
-        info!("Default source: '{:?}'", *default_source);
-        unsafe { (*mainloop_inner.as_ptr()).signal(false) };
-    });
-
+    // Allow pulseaudio to process callbacks again
+    mainloop.borrow_mut().unlock();
     loop {
         trace!("grabbing default source value");
-        let default_source = {
-            let source_inner = default_source.lock().unwrap();
-            source_inner.deref().clone()
-        };
-        trace!("source value grabbed...");
+        let default_source = src_rx.recv()?;
+        trace!("Grabbed default source");
         match default_source {
-            DefaultSourceState::Unset => {
-                mainloop.borrow_mut().wait();
-            }
             DefaultSourceState::NoDefault => {
-                mainloop.borrow_mut().unlock();
                 return Ok("No default source".to_owned());
             }
             DefaultSourceState::Default(name) => {
-                mainloop.borrow_mut().unlock();
+                trace!("Returning from get_sources");
                 return Ok(name.to_owned());
             }
         };
     }
 }
 
-fn get_default_source(
+fn get_default_source_index(
     mainloop: &RMainloop,
     context: &RContext,
     sources: &Sources,
@@ -248,7 +242,7 @@ fn setup_logs() {
             writeln!(
                 buf,
                 "{} [{}:{}] ({}): {}",
-                Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%z"),
+                Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%z"),
                 record.file().unwrap_or("unknown"),
                 record.line().unwrap_or(0),
                 record.level(),
@@ -261,20 +255,20 @@ fn setup_logs() {
 fn subscribe_source_mute(
     mainloop: RMainloop,
     context: RContext,
-    state: Rc<RefCell<ListenerState>>,
+    mut state: ListenerState,
 ) -> Result<(), Box<dyn Error>> {
     // Sources toggle their mute state, default source changes Server state
     let source_mask = InterestMaskSet::SOURCE | InterestMaskSet::SERVER;
 
     trace!("Configuring context subscriber");
+
+    // Block pulseaudio from invoking callbacks
     mainloop.borrow_mut().lock();
 
     let (tx, rx) = mpsc::channel();
     // tell pulseaudio to notify us about Source & Server changes
     {
         // set callback that reacts to subscription changes
-        let mainloop = mainloop.clone();
-        let state = state.clone();
         context.borrow_mut().set_subscribe_callback(Some(Box::new(
             move |facility: Option<Facility>, operation: Option<Operation>, idx| {
                 let facility = facility.unwrap();
@@ -286,21 +280,28 @@ fn subscribe_source_mute(
 
                 match facility {
                     Facility::Source => {
-                        debug!("Source event");
-                        if let Ok(Some(())) =
-                            handle_source_change(Rc::clone(&state).borrow_mut(), operation, idx)
-                        {
-                            trace!("mainloop should update sources");
-                            let _ = tx.send(Facility::Source);
-                            unsafe { (*mainloop.as_ptr()).signal(false) };
-                        } else {
-                            trace!("source event unrelated to default source, no need to update.");
+                        match operation {
+                            Operation::Changed => {
+                                // if state.default_source == id {
+                                // trace!("Default source changed config");
+                                // let old_mute_state = state.default_source().unwrap().mute;
+
+                                // tell callback that mainloop should update sources (can't do that here since
+                                // we're already inside a callback).
+                                // trace!("Source {} Changed", idx);
+                                tx.send(Facility::Source).unwrap();
+                            }
+                            Operation::New => {
+                                debug!("New source added with index {}", idx);
+                            }
+                            Operation::Removed => {
+                                debug!("Source with index {} removed", idx);
+                            }
                         }
                     }
                     Facility::Server => {
                         info!("Server change event");
                         let _ = tx.send(Facility::Server);
-                        unsafe { (*mainloop.as_ptr()).signal(false) };
                     }
                     _ => debug!("Unrelated event: {:?}", facility),
                 }
@@ -319,46 +320,56 @@ fn subscribe_source_mute(
     });
 
     // TODO: We should also bind to shutdown signal for clean teardown here...
+    trace!("Starting subscribe mainloop");
+
+    // Allow pulseaudio to process callbacks again
+    mainloop.borrow_mut().unlock();
     loop {
-        mainloop.borrow_mut().wait();
-        trace!("Caught signal in subscribe loop");
+        // When we receive data via channel here, it means, we should update sources, and then
+        // print if the mute state of the default source, changed.
 
-        // When we are signalled here, it means, we should update sources, and then print if the
-        // mute state of the default source, changed.
+        let old_default_mute = {
+            match state.default_source() {
+                Some(src) => Some(src.mute),
+                None => None,
+            }
+        };
+        trace!("current source mute state: {:?}", &old_default_mute);
 
-        let old_default_mute = state.borrow().default_source().unwrap().mute;
-        trace!("old default mute: {}, updating sources", old_default_mute);
-        trace!("releasing mainloop lock.");
-        mainloop.borrow_mut().unlock();
         let event_type = rx.recv()?;
         match event_type {
             Facility::Server => {
-                let _ = handle_server_change(&state, &mainloop, &context);
-                state.borrow_mut().sources = get_sources(&context, &mainloop).unwrap();
-            },
+                let _ = handle_server_change(&mut state, &mainloop, &context);
+                // Always check source changes, to ensure the new default's mute state is compared
+                // against prior mute state.
+                state.sources = get_sources(&context, &mainloop).unwrap();
+            }
             Facility::Source => {
-                state.borrow_mut().sources = get_sources(&context, &mainloop).unwrap();
-            },
-            _ => { panic!("impossible state"); },
+                state.sources = get_sources(&context, &mainloop).unwrap();
+            }
+            _ => {
+                panic!("impossible state");
+            }
         }
 
-        trace!("re-aquiring mainloop lock.");
-        mainloop.borrow_mut().lock();
-
-        if old_default_mute != state.borrow().default_source().unwrap().mute {
-            println!(
-                "{}",
-                match state.borrow().default_source().unwrap().mute {
-                    true => "MUTED",
-                    false => "UNMUTED",
-                }
-            );
+        if let Some(new_src) = state.default_source() {
+            if Some(new_src.mute) != old_default_mute {
+                println!(
+                    "{}",
+                    match new_src.mute {
+                        true => "MUTED",
+                        false => "UNMUTED",
+                    }
+                );
+            }
+        } else {
+            println!("No default source");
         }
     }
 }
 
 fn handle_server_change(
-    state: &RState,
+    state: &mut ListenerState,
     mainloop: &RMainloop,
     context: &RContext,
 ) -> Result<(), Box<dyn Error>> {
@@ -367,65 +378,30 @@ fn handle_server_change(
     // TODO: Do we need to check if the source map needs updating...?
     // Ideally - we collect sources once on start, then use the source add/remove subscriptions to
     // keep updated...
-    let default_source_idx = get_default_source(mainloop, context, &state.borrow().sources)?;
-    state.borrow_mut().default_source = default_source_idx;
+    state.default_source = get_default_source_index(mainloop, context, &state.sources)?;
 
     debug!(
         "Default source is now: {}",
-        state.borrow().default_source().unwrap().name
+        state.default_source().unwrap().name
     );
 
     Ok(())
 }
 
-fn handle_source_change(
-    state: RefMut<ListenerState>,
-    operation: Operation,
-    id: u32,
-) -> Result<Option<()>, Box<dyn Error>> {
-    // Check the index of the source that changed here against the default
-    // source, if the default source changed, check if mute was toggled and
-    // report...
-    trace!("Handling SourceChange event for index {}", id);
-    match operation {
-        Operation::Changed => {
-            if state.default_source == id {
-                trace!(
-                    "Default source changed config, old_state: {}",
-                    state.default_source().unwrap().mute
-                );
-                // let old_mute_state = state.default_source().unwrap().mute;
-
-                // tell callback that mainloop should update sources (can't do that here since
-                // we're already inside a callback).
-                return Ok(Some(()));
-            } else {
-                debug!("Something changed on a non-default source, ignoring");
-            }
-        }
-        Operation::New => {
-            debug!("New source added with index {}", id);
-        }
-        Operation::Removed => {
-            debug!("Source with index {} removed", id);
-        }
-    }
-    Ok(None)
-}
 
 fn connect_to_server(context: &RContext, mainloop: &RMainloop) -> Result<(), Box<dyn Error>> {
     trace!("Calling context.connect");
+    mainloop.borrow_mut().lock();
 
+    let (tx, rx) = mpsc::channel();
     {
         // Context state boxed-callback setup
-        let mainloop_inner = Rc::clone(&mainloop);
         trace!("Registering context state callback");
         context
             .borrow_mut()
             .set_state_callback(Some(Box::new(move || {
                 trace!("context state changed");
-                // Should be safe IFF we handle mainloop locks properly...
-                unsafe { (*mainloop_inner.as_ptr()).signal(false) };
+                tx.send(Some(())).unwrap();
             })));
     }
 
@@ -433,38 +409,36 @@ fn connect_to_server(context: &RContext, mainloop: &RMainloop) -> Result<(), Box
         .borrow_mut()
         .connect(None, FlagSet::NOAUTOSPAWN, None)?;
 
-    mainloop.borrow_mut().lock();
+    mainloop.borrow_mut().unlock();
     mainloop.borrow_mut().start()?;
 
     loop {
-        trace!("Waiting for mainloop signal to indicate state-change");
+        trace!("Waiting for context state-change callback");
+        let _ = rx.recv(); // Wait for signal from callback.
+        trace!("received");
 
-        match context.borrow().get_state() {
+        let state = context.borrow().get_state();
+        match state {
             State::Unconnected | State::Connecting | State::Authorizing | State::SettingName => {
-                debug!("Context connecting to server");
-
-                mainloop.borrow_mut().wait();
+                debug!("Context state: {:?}", state);
+                continue; // Use channel for synchronisation
             }
             State::Ready => {
-                debug!("Context connected and ready");
+                debug!("Context state: {:?}", state);
                 break;
             }
             State::Failed => {
-                error!("Context failed to connect, exiting.");
-                mainloop.borrow_mut().unlock();
+                debug!("Context state: {:?}", state);
                 return Err("Context connect failed".into());
             }
             State::Terminated => {
-                info!("Context was terminated, quitting");
-                mainloop.borrow_mut().unlock();
+                debug!("Context state: {:?}", state);
                 return Err("Context terminated".into());
             }
         }
     }
     // Once connected, we don't care anymore...
     context.borrow_mut().set_state_callback(None);
-
-    mainloop.borrow_mut().unlock();
 
     Ok(())
 }
