@@ -1,10 +1,15 @@
+use std::cell::Ref;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::{
     cell::{RefCell, RefMut},
     error::Error,
     ops::Deref,
-    process::exit,
-    rc::Rc,
 };
+
+use chrono::Local;
+use std::io::Write;
 
 use clap::Parser;
 use env_logger::Env;
@@ -15,9 +20,16 @@ use pulse::{
         subscribe::{Facility, InterestMaskSet, Operation},
         Context, FlagSet, State,
     },
-    mainloop::standard::{IterateResult, Mainloop},
+    // mainloop::standard::{IterateResult, Mainloop},
+    mainloop::{standard::IterateResult, threaded::Mainloop},
     proplist::Proplist,
 };
+
+type RContext = Rc<RefCell<Context>>;
+type RMainloop = Rc<RefCell<Mainloop>>;
+type RState = Rc<RefCell<ListenerState>>;
+
+type Sources = HashMap<u32, SourceDatum>;
 
 #[derive(Parser, Debug)]
 #[clap(author = "Sam Martin-Brown", version, about)]
@@ -35,14 +47,12 @@ struct Args {
 #[derive(Debug, Clone)]
 struct SourceDatum {
     name: String,
-    index: i32,
     mute: bool,
 }
 impl SourceDatum {
-    fn new(name: String, index: i32, mute: bool) -> Self {
+    fn new(name: String, mute: bool) -> Self {
         SourceDatum {
             name: name.to_string(),
-            index,
             mute,
         }
     }
@@ -56,33 +66,34 @@ enum Event {
 
 #[derive(Debug)]
 struct ListenerState {
-    sources: Vec<SourceDatum>,
-    default_source: SourceDatum,
+    // Use Pulseaudio's source index as key to source data (which is just name and mute-status)
+    sources: Sources,
+    default_source: u32,
 }
-
-type RContext = Rc<RefCell<Context>>;
-type RMainloop = Rc<RefCell<Mainloop>>;
-type RState = Rc<RefCell<ListenerState>>;
 
 impl ListenerState {
     fn new(mainloop: RMainloop, context: RContext) -> Result<Self, Box<dyn Error>> {
-        let sources = source_list(context.clone(), mainloop.clone())?;
+        let sources = get_sources(context.clone(), mainloop.clone())?;
         let default_source = get_default_source(mainloop, context, &sources)?;
         Ok(Self {
             sources,
             default_source,
         })
     }
+
+    fn default_source<'a>(&'a self) -> Option<&'a SourceDatum> {
+        self.sources.get(&self.default_source)
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logs();
 
-    let mainloop = Rc::new(RefCell::new(Mainloop::new().ok_or("mailoop new failed")?));
+    let mainloop = Rc::new(RefCell::new(Mainloop::new().ok_or("mainloop new failed")?));
 
     let proplist = Proplist::new().ok_or("proplist failed")?;
     let context = Rc::new(RefCell::new(
-        Context::new_with_proplist(mainloop.borrow().deref(), "source-listener", &proplist)
+        Context::new_with_proplist(mainloop.borrow_mut().deref(), "source-listener", &proplist)
             .ok_or("context::new_with_proplist failed")?,
     ));
 
@@ -98,100 +109,138 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     subscribe_source_mute(mainloop, context, state)
 }
 
-fn source_list(context: RContext, mainloop: RMainloop) -> Result<Vec<SourceDatum>, Box<dyn Error>> {
-    let introspector = context.borrow().introspect();
+enum SrcListState {
+    InProg,
+    Done,
+    Err(String),
+}
 
-    let sources = Rc::new(RefCell::new(vec![]));
-    let source_iter_done = Rc::new(RefCell::new(None));
+fn get_sources(context: RContext, mainloop: RMainloop) -> Result<Sources, Box<dyn Error>> {
+    trace!("get sources aquiring mainloop lock");
+    mainloop.borrow_mut().lock();
+    trace!("mainloop locked");
 
-    let sources_inner = sources.clone();
-    let source_iter_done_inner = source_iter_done.clone();
-    introspector.get_source_info_list(move |src| match src {
-        ListResult::Error => {
-            *source_iter_done_inner.borrow_mut() = Some(Err("Error collecting source info list"));
-        }
-        ListResult::End => {
-            *source_iter_done_inner.borrow_mut() = Some(Ok(()));
-        }
-        ListResult::Item(item) => {
-            let source_name = match &item.name {
-                None => "unknown".to_string(),
-                Some(name) => name.to_string(),
-            };
+    let introspector = context.borrow_mut().introspect();
 
-            sources_inner.borrow_mut().push(SourceDatum::new(
-                source_name,
-                item.index.try_into().unwrap(),
-                item.mute,
-            ));
-        }
-    });
+    let done = Rc::new(RefCell::new(SrcListState::InProg));
+    let sources = Rc::new(RefCell::new(HashMap::new()));
 
-    let source_iter_done_inner = source_iter_done.clone();
-    iter_loop_to_done(mainloop, context, move |_| {
-        // Check if source_iter_done is an Err or Ok
-        match source_iter_done_inner.borrow().deref() {
-            Some(_) => Ok(true),
-            None => Ok(false),
-        }
-    })?;
+    {
+        let sources = sources.clone();
+        let done = Rc::clone(&done);
 
-    let source_iter_result = source_iter_done.borrow().unwrap();
-    match source_iter_result {
-        Ok(_) => {
-            return Ok(sources.take());
-        }
-        Err(err) => {
-            return Err(err.into());
+        let mainloop = Rc::clone(&mainloop);
+
+        introspector.get_source_info_list(move |src| match src {
+            ListResult::Error => {
+                let msg = "Failed to retrieve ListResult".into();
+                error!("{}", msg);
+                *done.borrow_mut() = SrcListState::Err(msg);
+                unsafe { (*mainloop.as_ptr()).signal(false) };
+            }
+            ListResult::End => {
+                *done.borrow_mut() = SrcListState::Done;
+                unsafe { (*mainloop.as_ptr()).signal(false) };
+            }
+            ListResult::Item(item) => {
+                let source_name = match &item.name {
+                    None => "unknown".to_string(),
+                    Some(name) => name.to_string(),
+                };
+
+                sources
+                    .borrow_mut()
+                    .insert(item.index, SourceDatum::new(source_name, item.mute));
+            }
+        });
+    }
+
+    loop {
+        debug!("Waiting on mainloop signal");
+        mainloop.borrow_mut().wait();
+        match done.borrow_mut().deref() {
+            SrcListState::InProg => continue,
+            SrcListState::Done => {
+                trace!("get sources unlocking mainloop lock");
+                mainloop.borrow_mut().unlock();
+                return Ok(sources.borrow().deref().clone());
+            }
+            SrcListState::Err(err) => {
+                error!("Caught error waiting: {}", err);
+                trace!("get sources unlocking mainloop lock");
+                mainloop.borrow_mut().unlock();
+                return Err(err.to_owned().into());
+            }
         }
     }
+
+}
+
+#[derive(Debug, Clone)]
+enum DefaultSourceState {
+    NoDefault,
+    Default(String),
+    Unset,
 }
 
 fn find_default_source_name(
     context: RContext,
     mainloop: RMainloop,
 ) -> Result<String, Box<dyn Error>> {
-    let introspector = context.borrow().introspect();
+    mainloop.borrow_mut().lock();
+    let introspector = context.borrow_mut().introspect();
 
-    let default_source = Rc::new(RefCell::new(None));
+    let default_source = Arc::new(Mutex::new(DefaultSourceState::Unset));
 
     let default_source_inner = default_source.clone();
+    let mainloop_inner = Rc::clone(&mainloop);
     introspector.get_server_info(move |server_info| {
         trace!("Server info: {:?}", server_info);
-        let mut default_source = default_source_inner.borrow_mut();
+        let mut default_source = default_source_inner.lock().unwrap();
         match &server_info.default_source_name {
-            None => {}
+            None => *default_source = DefaultSourceState::NoDefault,
             Some(value) => {
-                *default_source = Some(value.to_string());
+                *default_source = DefaultSourceState::Default(value.to_string());
             }
         };
         info!("Default source: '{:?}'", *default_source);
+        unsafe { (*mainloop_inner.as_ptr()).signal(false) };
     });
 
-    iter_loop_to_done(mainloop, context, |_| {
-        let default_source = default_source.borrow();
-        match *default_source {
-            Some(_) => Ok(true),
-            None => Ok(false),
-        }
-    })?;
-    default_source.take().ok_or("No default source".into())
+    loop {
+        trace!("grabbing default source value");
+        let default_source = {
+            let source_inner = default_source.lock().unwrap();
+            source_inner.deref().clone()
+        };
+        trace!("source value grabbed...");
+        match default_source {
+            DefaultSourceState::Unset => {
+                mainloop.borrow_mut().wait();
+            }
+            DefaultSourceState::NoDefault => {
+                mainloop.borrow_mut().unlock();
+                return Ok("No default source".to_owned());
+            }
+            DefaultSourceState::Default(name) => {
+                mainloop.borrow_mut().unlock();
+                return Ok(name.to_owned());
+            }
+        };
+    }
 }
 
 fn get_default_source(
     mainloop: RMainloop,
     context: RContext,
-    sources: &Vec<SourceDatum>,
-) -> Result<SourceDatum, Box<dyn Error>> {
+    sources: &Sources,
+) -> Result<u32, Box<dyn Error>> {
     let default_source_name = find_default_source_name(context, mainloop)?;
 
-    for source in sources {
+    for (index, source) in sources {
         if source.name == default_source_name {
-            debug!(
-                "Default source is: '{}', index: {}",
-                source.name, source.index
-            );
-            return Ok(source.clone());
+            debug!("Default source is: '{}', index: {}", source.name, index);
+            return Ok(*index);
         }
     }
 
@@ -217,7 +266,51 @@ fn subscribe_source_mute(
     // Sources toggle their mute state, default source changes Server state
     let source_mask = InterestMaskSet::SOURCE | InterestMaskSet::SERVER;
 
+    trace!("Configuring context subscriber");
+    mainloop.borrow_mut().lock();
     // tell pulseaudio to notify us about Source & Server changes
+    {
+        // set callback that reacts to subscription changes
+        let mainloop = mainloop.clone();
+        let context_inner = context.clone();
+        let state = state.clone();
+        context.borrow_mut().set_subscribe_callback(Some(Box::new(
+            move |facility: Option<Facility>, operation: Option<Operation>, idx| {
+                let facility = facility.unwrap();
+                let operation = operation.unwrap();
+                debug!(
+                    "Subcribe callback: {:?}, {:?}, {:?}",
+                    facility, operation, idx
+                );
+
+                match facility {
+                    Facility::Source => {
+                        debug!("Source event");
+                        if let Ok(Some(())) = handle_source_change(
+                            Rc::clone(&state).borrow_mut(),
+                            operation,
+                            idx,
+                        ) {
+                            trace!("mainloop should update sources");
+                            unsafe { (*mainloop.as_ptr()).signal(false) };
+                        } else {
+                            trace!("source event unrelated to default source, no need to update.");
+                        }
+                    }
+                    Facility::Server => {
+                        info!("Server change event");
+                        let _ = handle_server_change(
+                            state.clone(),
+                            mainloop.clone(),
+                            context_inner.clone(),
+                        );
+                    }
+                    _ => debug!("Unrelated event: {:?}", facility),
+                }
+            },
+        )));
+    }
+
     context.borrow_mut().subscribe(source_mask, |sub_success| {
         debug!(
             "Subscribing to source changes {}",
@@ -228,53 +321,38 @@ fn subscribe_source_mute(
         );
     });
 
-    // set callback that reacts to subscription changes
-    let mainloop_inner = mainloop.clone();
-    let context_inner = context.clone();
-    let state_inner = state.clone();
-    let mut mut_context = context.borrow_mut();
-    mut_context.set_subscribe_callback(Some(Box::new(
-        move |facility: Option<Facility>, operation: Option<Operation>, idx| {
-            let facility = facility.unwrap();
-            let operation = operation.unwrap();
-            debug!(
-                "Subcribe callback: {:?}, {:?}, {:?}",
-                facility, operation, idx
-            );
+    // TODO: We need to loop on mainloop wait here...
+    loop {
+        mainloop.borrow_mut().wait();
+        trace!("Caught signal in subscribe loop");
 
-            match facility {
-                Facility::Source => {
-                    debug!("Source event");
-                    let _ = handle_source_change(Rc::clone(&state).borrow_mut(), operation, idx);
-                }
-                Facility::Server => {
-                    info!("Server change event");
-                    let _ = handle_server_change(
-                        state_inner.clone(),
-                        mainloop_inner.clone(),
-                        context_inner.clone(),
-                    );
-                }
-                _ => debug!("Unrelated event: {:?}", facility),
-            }
-        },
-    )));
+        // When we are signalled here, it means, we should update sources, and then print if the
+        // mute state of the default source, changed.
+        //
 
-    // Run loop listening to changes
-    // The closure here essentially is run in the loop, with some boilerplate to react to loop
-    // shutdown or error etc.
-    //
-    // TODO: let this gracefully exit on signal
-    match mainloop.clone().borrow_mut().run() {
-        Ok(_) => Ok(()),
-        Err((pa_err, retval)) => {
-            error!(
-                "Encountered error whilst subscribed to pulseaudio: '{}', return value: {:?}",
-                pa_err, retval
+        let old_default_mute = state.borrow().default_source().unwrap().mute;
+        trace!("old default mute: {}, updating sources", old_default_mute);
+        trace!("releasing mainloop lock.");
+        mainloop.borrow_mut().unlock();
+        state.borrow_mut().sources =
+            get_sources(Rc::clone(&context), Rc::clone(&mainloop)).unwrap();
+
+        trace!("re-aquiring mainloop lock.");
+        mainloop.borrow_mut().lock();
+
+        if old_default_mute != state.borrow().default_source().unwrap().mute {
+            println!(
+                "{}",
+                match state.borrow().default_source().unwrap().mute {
+                    true => "MUTED",
+                    false => "UNMUTED",
+                }
             );
-            Err(Box::new(pa_err))
         }
     }
+    // TODO: We should also bind to shutdown signal for clean teardown here...
+    mainloop.borrow_mut().unlock();
+    Ok(())
 }
 
 fn handle_server_change(
@@ -284,12 +362,22 @@ fn handle_server_change(
 ) -> Result<(), Box<dyn Error>> {
     // Check if default source changed and update state
     debug!("Updating default source after server config change");
-    state.borrow_mut().default_source =
-        get_default_source(mainloop.clone(), context.clone(), &state.borrow().sources)?;
+    // TODO: Do we need to check if the source map needs updating...?
+    // Ideally - we collect sources once on start, then use the source add/remove subscriptions to
+    // keep updated...
+    state.borrow_mut().default_source = get_default_source(
+        mainloop.clone(),
+        context.clone(),
+        &state.borrow_mut().sources,
+    )?;
 
     debug!(
         "Default source is now: {}",
-        state.borrow().default_source.name
+        state
+            .borrow()
+            .default_source()
+            .unwrap()
+            .name
     );
 
     Ok(())
@@ -299,36 +387,25 @@ fn handle_source_change(
     state: RefMut<ListenerState>,
     operation: Operation,
     id: u32,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Option<()>, Box<dyn Error>> {
     // Check the index of the source that changed here against the default
     // source, if the default source changed, check if mute was toggled and
     // report...
     trace!("Handling SourceChange event for index {}", id);
     match operation {
         Operation::Changed => {
-            if state.default_source.index == id as i32 {
-                trace!("Default source changed config");
-                let old_mute_state = state.default_source.mute;
+            if state.default_source == id {
+                trace!(
+                    "Default source changed config, old_state: {}",
+                    state.default_source().unwrap().mute
+                );
+                // let old_mute_state = state.default_source().unwrap().mute;
 
-                // This gets the full source list and server data on every call which feels pretty
-                // wasteful.
-                //
-                // Should be able to optimise so that that data is only actually calculated when we detect
-                // new/removed sources (which could change indexes), or on new default source (already
-                // implemented).
-                // state.default_source = get_default_source(mainloop.clone(), context.clone(), state.sources)?;
-
-                if old_mute_state != state.default_source.mute {
-                    println!(
-                        "{}",
-                        match state.default_source.mute {
-                            true => "MUTED",
-                            false => "UNMUTED",
-                        }
-                    );
-                }
+                // tell callback that mainloop should update sources (can't do that here since
+                // we're already inside a callback).
+                return Ok(Some(()));
             } else {
-                debug!("Something changed on a non-default source");
+                debug!("Something changed on a non-default source, ignoring");
             }
         }
         Operation::New => {
@@ -338,64 +415,61 @@ fn handle_source_change(
             debug!("Source with index {} removed", id);
         }
     }
-    Ok(())
-}
-
-fn iter_loop_to_done(
-    mainloop: RMainloop,
-    context: RContext,
-    mut done_chk: impl FnMut(RContext) -> Result<bool, Box<dyn Error>>,
-) -> Result<(), Box<dyn Error>> {
-    loop {
-        // Use Mainloop iterate to process data from pulseaudio server, this iterate is what
-        // executes our various callbacks etc. (true here blocks mainloop to wait for events)
-        match mainloop.borrow_mut().iterate(true) {
-            IterateResult::Err(err) => {
-                error!("Caught error running mainloop: {}", err);
-                exit(1);
-            }
-            IterateResult::Quit(retval) => {
-                info!("Quit called, retval: {:?}", retval);
-                exit(retval.0);
-            }
-            IterateResult::Success(num_dispatched) => {
-                if num_dispatched > 0 {
-                    trace!("Iterate succeeded, dispatched {} events", num_dispatched);
-                }
-
-                if done_chk(context.clone())? {
-                    return Ok(());
-                }
-            }
-        };
-    }
+    Ok(None)
 }
 
 fn connect_to_server(context: RContext, mainloop: RMainloop) -> Result<(), Box<dyn Error>> {
+    trace!("Calling context.connect");
+
+    {
+        // Context state boxed-callback setup
+        let mainloop_inner = Rc::clone(&mainloop);
+        trace!("Registering context state callback");
+        context
+            .borrow_mut()
+            .set_state_callback(Some(Box::new(move || {
+                trace!("context state changed");
+                // Should be safe IFF we handle mainloop locks properly...
+                unsafe { (*mainloop_inner.as_ptr()).signal(false) };
+            })));
+    }
+
     context
         .borrow_mut()
         .connect(None, FlagSet::NOAUTOSPAWN, None)?;
-    iter_loop_to_done(mainloop, context, |context| {
+
+    mainloop.borrow_mut().lock();
+    mainloop.borrow_mut().start()?;
+
+    loop {
+        trace!("Waiting for mainloop signal to indicate state-change");
+
         match context.borrow().get_state() {
             State::Unconnected | State::Connecting | State::Authorizing | State::SettingName => {
                 debug!("Context connecting to server");
-                return Ok(false);
-            }
 
+                mainloop.borrow_mut().wait();
+            }
             State::Ready => {
                 debug!("Context connected and ready");
-                return Ok(true);
+                break;
             }
-
             State::Failed => {
                 error!("Context failed to connect, exiting.");
-                return Ok(false);
+                mainloop.borrow_mut().unlock();
+                return Err("Context connect failed".into());
             }
             State::Terminated => {
-                info!("Context was terminated cleanly, quitting");
-                return Ok(false);
+                info!("Context was terminated, quitting");
+                mainloop.borrow_mut().unlock();
+                return Err("Context terminated".into());
             }
         }
-    })?;
+    }
+    // Once connected, we don't care anymore...
+    context.borrow_mut().set_state_callback(None);
+
+    mainloop.borrow_mut().unlock();
+
     Ok(())
 }
