@@ -36,9 +36,18 @@ struct Args {
     #[arg(short = 'v')]
     verbose: bool,
 
-    /// an optional name to greet
-    #[arg()]
-    name: Option<String>,
+    /// Text to emit when default source is muted
+    #[arg(long, short, default_value = "MUTED")]
+    mute_text: Option<String>,
+
+    /// Text to emit when default source is unmuted
+    #[arg(long, short, default_value = "UNMUTED")]
+    unmute_text: Option<String>,
+
+    /// Text to emit when default source is missing (no mic connected, etc.)
+    #[arg(long, short, default_value = "NO SOURCE")]
+    no_src_text: Option<String>,
+
 }
 
 #[derive(Debug, Clone)]
@@ -117,15 +126,23 @@ struct ListenerState {
     // Use Pulseaudio's source index as key to source data (which is just name and mute-status)
     sources: Sources,
     default_source_id: Option<u32>,
+
+    mute_text: String,
+    unmute_text: String,
+    nosource_text: String,
 }
 
 impl ListenerState {
-    fn new(mainloop: &mut Mainloop, context: &mut Context) -> Result<Self, Errors> {
+    fn new(cli_args: Args, mainloop: &mut Mainloop, context: &mut Context) -> Result<Self, Errors> {
         let sources = get_sources(context, mainloop)?;
         let default_source_id = get_default_source_index(mainloop, context, &sources)?;
+
         Ok(Self {
             sources,
             default_source_id,
+            mute_text: cli_args.mute_text.unwrap(),
+            unmute_text: cli_args.unmute_text.unwrap(),
+            nosource_text: cli_args.no_src_text.unwrap(),
         })
     }
 
@@ -158,7 +175,8 @@ fn bind_signals(
 }
 
 fn main() -> Result<(), Errors> {
-    setup_logs();
+    let args = Args::parse();
+    setup_logs(args.verbose);
 
     let (tx, rx) = mpsc::channel();
     let mut mainloop =
@@ -173,7 +191,7 @@ fn main() -> Result<(), Errors> {
     info!("Connecting to daemon");
     connect_to_server(&mut context, &mut mainloop, tx.clone(), &rx)?;
 
-    let state = ListenerState::new(&mut mainloop, &mut context)?;
+    let state = ListenerState::new(args, &mut mainloop, &mut context)?;
     report_mute_change(&state, None);
     let subscribe_result =
         subscribe_source_mute(&mut mainloop, &mut context, state, tx.clone(), rx);
@@ -361,9 +379,8 @@ fn get_default_source_index(
     Ok(None)
 }
 
-fn setup_logs() {
-    let args = Args::parse();
-    let log_env = if args.verbose {
+fn setup_logs(verbose: bool) {
+    let log_env = if verbose {
         Env::default().default_filter_or("debug")
     } else {
         Env::default().default_filter_or("info")
@@ -547,13 +564,13 @@ fn report_mute_change(state: &ListenerState, old_default_mute: Option<bool>) {
             println!(
                 "{}",
                 match new_src.mute {
-                    true => "MUTED",
-                    false => "UNMUTED",
+                    true => &state.mute_text,
+                    false => &state.unmute_text,
                 }
             );
         }
     } else {
-        println!("No default source");
+        println!("{}", &state.nosource_text);
     }
 }
 
