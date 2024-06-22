@@ -140,15 +140,15 @@ impl ListenerState {
     }
 }
 
-fn setup_unix_signals(
+fn bind_signals(
     mainloop: &mut Mainloop,
     sig_tx: Sender<CallbackComms>,
 ) -> Result<Vec<Event>, Errors> {
     let mut signals = vec![];
-    for sig_id in [2 /* , 15 */] {
+    for sig_id in &[1, 2 , 15] {
         let sig_tx = sig_tx.clone();
 
-        signals.push(Event::new(sig_id, move |sig_num| {
+        signals.push(Event::new(*sig_id, move |sig_num| {
             // TODO: can I translate from i32 to human-readable name..?
             info!("Received a signal, num {}", sig_num);
             sig_tx.send(CallbackComms::Shutdown).unwrap();
@@ -160,16 +160,16 @@ fn setup_unix_signals(
     Ok(signals)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Errors> {
     setup_logs();
 
     let (tx, rx) = mpsc::channel();
-    let mut mainloop = Mainloop::new().ok_or("mainloop new failed")?;
-    let _sig_events = setup_unix_signals(&mut mainloop, tx.clone())?;
+    let mut mainloop = Mainloop::new().ok_or(Errors::ContextError("mainloop new failed".to_string()))?;
+    let _sig_events = bind_signals(&mut mainloop, tx.clone())?;
 
-    let proplist = Proplist::new().ok_or("proplist failed")?;
+    let proplist = Proplist::new().ok_or(Errors::ContextError("proplist failed".to_string()))?;
     let mut context = Context::new_with_proplist(&mainloop, "source-listener", &proplist)
-        .ok_or("context::new_with_proplist failed")?;
+        .ok_or(Errors::ContextError("context::new_with_proplist failed".to_string()))?;
 
     info!("Connecting to daemon");
     connect_to_server(&mut context, &mut mainloop, tx.clone(), &rx)?;
@@ -177,14 +177,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     debug!("We should be connected at this point..!");
 
     let state = ListenerState::new(&mut mainloop, &mut context, tx.clone(), &rx)?;
-    let subscribe_result = subscribe_source_mute(mainloop, context, state, tx.clone(), rx);
-    match subscribe_result {
-        Ok(_) => Ok(()),
-        Err(err) => match err {
-            Errors::Shutdown => Ok(()),
-            _ => Err(Box::new(err)),
-        },
+    let subscribe_result = subscribe_source_mute(&mut mainloop, &mut context, state, tx.clone(), rx);
+    info!("shutting down");
+    terminate(mainloop, context, _sig_events);
+
+    if let Err(Errors::Shutdown) = subscribe_result {
+        return Ok(());
     }
+    return subscribe_result;
+}
+
+fn terminate(mut mainloop: Mainloop, mut context: Context, sig_events: Vec<Event>) {
+    trace!("Disconnecting context");
+    mainloop.lock();
+    context.disconnect();
+    mainloop.unlock();
+    trace!("Stopping mainloop");
+    mainloop.stop();
+    trace!("dropping signal handlers");
+    drop(sig_events);
+    // Seems to cause crashes... unsure why
+    // mainloop.signals_done();
+    trace!("Termination complete");
 }
 
 fn get_sources(
@@ -349,8 +363,8 @@ fn setup_logs() {
 }
 
 fn subscribe_source_mute(
-    mut mainloop: Mainloop,
-    mut context: Context,
+    mainloop: &mut Mainloop,
+    context: &mut Context,
     mut state: ListenerState,
     tx: CBTX,
     rx: CBRX,
@@ -445,19 +459,19 @@ fn subscribe_source_mute(
                     Facility::Server => {
                         let _ = handle_server_change(
                             &mut state,
-                            &mut mainloop,
-                            &mut context,
+                            mainloop,
+                            context,
                             tx.clone(),
                             &rx,
                         );
                         // Always check source changes, to ensure the new default's mute state is compared
                         // against prior mute state.
                         state.sources =
-                            get_sources(&context, &mut mainloop, tx.clone(), &rx).unwrap();
+                            get_sources(&context, mainloop, tx.clone(), &rx).unwrap();
                     }
                     Facility::Source => {
                         state.sources =
-                            get_sources(&context, &mut mainloop, tx.clone(), &rx).unwrap();
+                            get_sources(&context, mainloop, tx.clone(), &rx).unwrap();
                     }
                     _ => panic!("impossible state {:?}", change),
                 }
