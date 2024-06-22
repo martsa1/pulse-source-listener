@@ -312,7 +312,6 @@ fn find_default_source_name(
     {
         let tx = tx.clone();
         introspector.get_server_info(move |server_info| {
-            trace!("Server info: {:?}", server_info);
             match &server_info.default_source_name {
                 None => {
                     info!("no default source");
@@ -483,9 +482,6 @@ fn subscribe_source_mute(
                         if let Some(src) = state.default_source() {
                             info!("Default source is now: {}", src.name);
                         }
-                        // Always check source changes, to ensure the new default's mute state is
-                        // compared against prior mute state.
-                        state.sources = get_sources(context, mainloop)?;
                     }
                     PulseChange::SourceNew(_) => {
                         // Do nothing, seems reliable that you get a change as well as a New when
