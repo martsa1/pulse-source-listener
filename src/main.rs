@@ -373,8 +373,11 @@ fn setup_logs() {
         .format(|buf, record| {
             writeln!(
                 buf,
-                "{} [{}:{}] ({}): {}",
+                "{} [{}:{}:{}] ({}): {}",
                 Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%z"),
+                std::thread::current()
+                    .name()
+                    .unwrap_or(&format!("{:?}", std::thread::current().id())),
                 record.file().unwrap_or("unknown"),
                 record.line().unwrap_or(0),
                 record.level(),
