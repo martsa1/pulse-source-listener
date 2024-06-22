@@ -1,11 +1,22 @@
 {
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    flake-parts.url = "github:hercules-ci/flake-parts";
-    systems.url = "github:nix-systems/default";
+    flake-parts = {
+      url = "github:hercules-ci/flake-parts";
+      # doesn't depend on nixpkgs...
+      # inputs.nixpkgs.follows = "nixpkgs";
+    };
+    systems = {
+      url = "github:nix-systems/default";
+      # doesn't depend on nixpkgs...
+      # inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     # Dev tools
-    treefmt-nix.url = "github:numtide/treefmt-nix";
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = inputs:
